@@ -1,0 +1,419 @@
+@page "/reimbursement-agent"
+@rendermode InteractiveServer
+@using Microsoft.AspNetCore.Components.Forms
+@using ExpenseReimbursementUI.Services
+@using System.Text.Json
+@using System.Linq
+@using ExpenseReimbursementUI.Models
+@inject ExpenseApiService ExpenseApi
+
+<PageTitle>Reimbursement Agent</PageTitle>
+
+<div class="container py-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h2>Expense & Reimbursement Agent</h2>
+            <p class="text-muted">
+                Upload receipts and prepare your reimbursement claim.
+            </p>
+        </div>
+        <span class="badge bg-primary">AI Assistant</span>
+    </div>
+
+    <div class="card shadow-sm mb-4">
+        <div class="card-body">
+            <h5>Upload your receipts</h5>
+            <p class="text-muted">
+                Select PDF, JPG, JPEG or PNG files.
+            </p>
+
+            <InputFile OnChange="OnFilesSelected"
+                       multiple
+                       accept=".pdf,.jpg,.jpeg,.png" />
+
+            @if (selectedFiles.Count > 0)
+            {
+                <p class="mt-2">
+                    @selectedFiles.Count receipt(s) selected
+                </p>
+
+                @foreach (var file in selectedFiles)
+                {
+                    <div class="d-flex justify-content-between mb-2">
+                        <span>@file.Name</span>
+                        <button class="btn btn-sm btn-outline-danger"
+                                @onclick="() => RemoveFile(file)">
+                            Remove
+                        </button>
+                    </div>
+                }
+            }
+
+            <button class="btn btn-primary mt-3"
+                    @onclick="ProcessReceipts"
+                    disabled="@(selectedFiles.Count == 0 || isProcessing)">
+                @(isProcessing ? "Processing receipts..." : "Process Receipts")
+            </button>
+
+            @if (!string.IsNullOrWhiteSpace(errorMessage))
+            {
+                <div class="alert alert-warning mt-3">
+                    @errorMessage
+                </div>
+            }
+        </div>
+    </div>
+
+    <div class="card shadow-sm mb-4">
+        <div class="card-header">
+            <strong>Reimbursement Assistant</strong>
+        </div>
+
+        <div class="card-body">
+            <div style="min-height:180px; max-height:350px; overflow-y:auto">
+                @foreach (var message in messages)
+                {
+                    <div class="mb-3">
+                        <strong>
+                            @(message.IsUser ? "You" : "Assistant"):
+                        </strong>
+                        <div style="white-space:pre-wrap">@message.Text</div>
+                    </div>
+                }
+            </div>
+
+            <div class="input-group mt-3">
+                <input class="form-control"
+                       @bind="chatInput"
+                       @bind:event="oninput"
+                       @onkeydown="HandleKeyDown"
+                       placeholder="Ask about your receipts or claim..." />
+
+                <button class="btn btn-primary"
+                        @onclick="SendMessage"
+                        disabled="@string.IsNullOrWhiteSpace(chatInput)">
+                    Send
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="card shadow-sm">
+        <div class="card-header">
+            <strong>Claim Review</strong>
+        </div>
+
+        <div class="card-body">
+            @if (receipts.Count == 0)
+            {
+                <p class="text-muted">
+                    Your processed receipts and claim summary will appear here.
+                </p>
+            }
+            else
+            {
+                <p><strong>Receipts processed:</strong> @receipts.Count</p>
+                <p><strong>Known receipt total:</strong> ₹@KnownTotal.ToString("N2")</p>
+                <p><strong>Receipts needing attention:</strong> @NeedsReviewCount</p>
+
+                <div class="table-responsive">
+                    <table class="table table-striped">
+                        <thead>
+                            <tr>
+                                <th>Receipt</th>
+                                <th>Bill Number</th>
+                                <th>Date</th>
+                                <th>Amount</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var receipt in receipts)
+                            {
+                                <tr @key="receipt.FileName">
+                                    <td>@receipt.FileName</td>
+                                    <td>@(receipt.BillNumber ?? "Missing")</td>
+                                    <td>@(receipt.BillDate ?? "Missing")</td>
+                                    <td>
+                                        @(receipt.Amount.HasValue
+                                            ? $"₹{receipt.Amount.Value:N2}"
+                                            : "Needs confirmation")
+                                    </td>
+                                    <td>@receipt.Status</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+
+                @if (NeedsReviewCount == 0)
+                {
+                    <p class="text-success">
+                        No missing details detected by the current checks.
+                        Verify the receipts before submission.
+                    </p>
+                }
+                else
+                {
+                    <p class="text-warning">
+                        Please review receipts with missing amounts or details.
+                    </p>
+                }
+
+                <button class="btn btn-success"
+                        @onclick="PrepareSubmission"
+                        disabled="@(NeedsReviewCount > 0 || receipts.Count == 0)">
+                    Prepare Demo Submission
+                </button>
+
+                @if (!string.IsNullOrWhiteSpace(submissionMessage))
+                {
+                    <div class="alert alert-info mt-3">
+                        @submissionMessage
+                    </div>
+                }
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    private List<IBrowserFile> selectedFiles = new();
+    private List<ReceiptInfo> receipts = new();
+    private List<ChatMessage> messages = new();
+
+    private string chatInput = "";
+    private string? errorMessage;
+    private string? submissionMessage;
+    private bool isProcessing;
+
+    private decimal KnownTotal =>
+        receipts.Sum(r => r.Amount ?? 0m);
+
+    private int NeedsReviewCount =>
+        receipts.Count(r =>
+            !r.Amount.HasValue ||
+            string.IsNullOrWhiteSpace(r.BillNumber) ||
+            string.IsNullOrWhiteSpace(r.BillDate) ||
+            r.Status == "Manual Review" ||
+            r.Status == "Rejected");
+
+    protected override void OnInitialized()
+    {
+        messages.Add(new ChatMessage(
+            "Hello! Upload your receipts and I'll help prepare your reimbursement claim. " +
+            "I'll flag uncertain details instead of guessing.",
+            false));
+    }
+
+    private void OnFilesSelected(InputFileChangeEventArgs e)
+    {
+        selectedFiles = e.GetMultipleFiles(20).ToList();
+        errorMessage = null;
+        submissionMessage = null;
+    }
+
+    private void RemoveFile(IBrowserFile file)
+    {
+        selectedFiles.Remove(file);
+    }
+
+    private async Task ProcessReceipts()
+    {
+        if (isProcessing || selectedFiles.Count == 0)
+            return;
+
+        isProcessing = true;
+        errorMessage = null;
+        submissionMessage = null;
+
+        var errors = new List<string>();
+
+        try
+        {
+            foreach (var file in selectedFiles.ToList())
+            {
+                try
+                {
+                    var response = await ExpenseApi.UploadReceiptAsync(file);
+
+                    using var document = JsonDocument.Parse(response);
+                    var root = document.RootElement;
+                    var bill = root.GetProperty("bill_details");
+                    var claim = root.GetProperty("claim_result");
+
+                    decimal? amount = null;
+                    var amountElement = bill.GetProperty("total_amount");
+
+                    if (amountElement.ValueKind == JsonValueKind.Number)
+                        amount = amountElement.GetDecimal();
+
+                    var billNumber =
+                        bill.GetProperty("bill_number").GetString();
+
+                    var billDate =
+                        bill.GetProperty("bill_date").GetString();
+
+                    var status =
+                        claim.GetProperty("status").GetString()
+                        ?? "Manual Review";
+
+                    var reason =
+                        claim.GetProperty("reason").GetString();
+
+                    // Flag repeated bill numbers for review.
+                    var duplicate = !string.IsNullOrWhiteSpace(billNumber)
+                        && receipts.Any(r =>
+                            string.Equals(r.BillNumber?.Trim(),
+                                billNumber.Trim(),
+                                StringComparison.OrdinalIgnoreCase));
+
+                    if (duplicate)
+                    {
+                        status = "Manual Review";
+                        reason = "Possible duplicate bill number. Please verify.";
+                    }
+
+                    receipts.RemoveAll(r => r.FileName == file.Name);
+
+                    receipts.Insert(0, new ReceiptInfo
+                    {
+                        FileName = file.Name,
+                        BillNumber = billNumber,
+                        BillDate = billDate,
+                        Amount = amount,
+                        Status = status,
+                        Reason = reason
+                    });
+
+                    var amountText = amount.HasValue
+                        ? $"₹{amount.Value:N2}"
+                        : "not confidently identified";
+
+                    messages.Add(new ChatMessage(
+                        $"Processed {file.Name}. Amount: {amountText}. " +
+                        $"Status: {status}. " +
+                        (string.IsNullOrWhiteSpace(reason) ? "" : $"Note: {reason}"),
+                        false));
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"{file.Name}: {ex.Message}");
+                }
+            }
+
+            if (errors.Count > 0)
+                errorMessage = string.Join("\n", errors);
+
+            if (receipts.Count > 0)
+            {
+                messages.Add(new ChatMessage(
+                    $"Your claim currently contains {receipts.Count} receipt(s). " +
+                    $"{NeedsReviewCount} receipt(s) need attention. " +
+                    "You can ask me about the current claim summary.",
+                    false));
+            }
+        }
+        finally
+        {
+            isProcessing = false;
+        }
+    }
+
+    private void SendMessage()
+    {
+        if (string.IsNullOrWhiteSpace(chatInput))
+            return;
+
+        var question = chatInput.Trim();
+        messages.Add(new ChatMessage(question, true));
+
+        var q = question.ToLowerInvariant();
+        string answer;
+
+        if (receipts.Count == 0)
+        {
+            answer = "Please upload and process your receipts first. " +
+                     "Then I can answer questions using the available claim data.";
+        }
+        else if (q.Contains("amount") || q.Contains("total"))
+        {
+            answer = $"The total of identified receipt amounts is ₹{KnownTotal:N2}. " +
+                     "Receipts with unknown amounts are excluded from this figure.";
+        }
+        else if (q.Contains("missing") || q.Contains("review"))
+        {
+            answer = $"{NeedsReviewCount} receipt(s) need attention. " +
+                     "Check missing amounts, bill numbers, dates, and review statuses.";
+        }
+        else if (q.Contains("duplicate"))
+        {
+            var duplicates = receipts
+                .Where(r => r.Reason?.Contains("duplicate",
+                    StringComparison.OrdinalIgnoreCase) == true)
+                .Select(r => r.FileName)
+                .ToList();
+
+            answer = duplicates.Count == 0
+                ? "No repeated bill numbers have been detected in this session. " +
+                  "This does not rule out every possible duplicate."
+                : "Possible duplicates:\n" + string.Join("\n", duplicates);
+        }
+        else if (q.Contains("status") || q.Contains("claim"))
+        {
+            answer = $"Receipts: {receipts.Count}; " +
+                     $"identified total: ₹{KnownTotal:N2}; " +
+                     $"needing attention: {NeedsReviewCount}. " +
+                     "Please verify all receipt details before submission.";
+        }
+        else
+        {
+            answer = "I can summarize your claim, show identified totals, " +
+                     "and flag missing details or possible duplicate bill numbers. " +
+                     "This first version uses rule-based responses, not an AI model.";
+        }
+
+        messages.Add(new ChatMessage(answer, false));
+        chatInput = "";
+    }
+
+    private async Task HandleKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter")
+            SendMessage();
+
+        await Task.CompletedTask;
+    }
+
+    private void PrepareSubmission()
+    {
+        if (NeedsReviewCount > 0 || receipts.Count == 0)
+            return;
+
+        submissionMessage =
+            "Demo claim prepared for review. No real reimbursement was submitted.";
+    }
+
+    private class ReceiptInfo
+    {
+        public string FileName { get; set; } = "";
+        public string? BillNumber { get; set; }
+        public string? BillDate { get; set; }
+        public decimal? Amount { get; set; }
+        public string Status { get; set; } = "Manual Review";
+        public string? Reason { get; set; }
+    }
+
+    private class ChatMessage
+    {
+        public string Text { get; set; } = "";
+        public bool IsUser { get; set; }
+
+        public ChatMessage(string text, bool isUser)
+        {
+            Text = text;
+            IsUser = isUser;
+        }
+    }
+}
+```
